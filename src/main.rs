@@ -177,7 +177,9 @@ async fn main() {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "DEBUG".into()))
         .with(layer().json())
         .init();
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 3000)).await.unwrap();
+
+    let port: u16 = std::env::var("PORT").ok().and_then(|port| port.parse().ok()).unwrap_or(3000);
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await.unwrap();
     start_server(listener).await;
 }
 

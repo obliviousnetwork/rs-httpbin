@@ -1,5 +1,8 @@
-app = 'rs-httpbin'
+app = 'oblivious-httpbin'
 primary_region = 'lax'
+
+[env]
+PORT = 3000
 
 [build]
 dockerfile = 'Dockerfile'
@@ -14,8 +17,8 @@ processes = ['app']
 
 [http_service.concurrency]
 type = 'requests'
-hard_limit = 250
-soft_limit = 200
+soft_limit = 2000
+hard_limit = 4000
 
 [[vm]]
 memory = '256MB'

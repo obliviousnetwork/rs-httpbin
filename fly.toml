@@ -20,6 +20,13 @@ type = 'requests'
 soft_limit = 2000
 hard_limit = 4000
 
+[[http_service.checks]]
+  grace_period = "5s"
+	interval = "30s"
+	method = "GET"
+	timeout = "5s"
+	path = "/get"
+
 [[vm]]
 memory = '256MB'
 cpu_kind = 'shared'

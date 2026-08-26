@@ -588,7 +588,7 @@ async fn unstable() -> Result<()> {
     }
     dbg!(success_count);
     // Check that the success count is within a reasonable range
-    assert!(success_count >= 450 && success_count <= 550);
+    assert!((450..=550).contains(&success_count));
 
     Ok(())
 }

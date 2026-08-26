@@ -124,22 +124,8 @@ fn app() -> Router<()> {
                 .route("/links/{total}/{page}", any(links::links)),
         )
         .route("/unstable", get(unstable))
-        .route(
-            "/delay/{n}",
-            any(anything).layer({
-                async fn delay(Path(delays): Path<u16>, request: Request, next: middleware::Next) -> impl IntoResponse {
-                    let before = Instant::now();
-                    tokio::time::sleep(Duration::from_secs(delays.min(10).into())).await;
-                    let resp = next.run(request).await;
-                    let after = Instant::now();
-                    (
-                        AppendHeaders([("Server-Timing", format!("delay;dur={}", (after - before).as_millis()))]),
-                        resp,
-                    )
-                }
-                middleware::from_fn(delay)
-            }),
-        )
+        .route("/delay/{n}", any(anything).layer(middleware::from_fn(delay_s)))
+        .route("/delay/ms/{n}", any(anything).layer(middleware::from_fn(delay_ms)))
         .route("/websocket/echo", any(ws::ws_handler))
         .route("/websocket/chat", any(ws_chat::ws_handler))
         .route(
@@ -491,6 +477,21 @@ async fn hostname() -> impl IntoResponse {
 
 async fn utf8() -> impl IntoResponse {
     Html(include_str!("../assets/utf8.html"))
+}
+
+async fn delay_ms(Path(delayms): Path<u16>, request: Request, next: middleware::Next) -> impl IntoResponse {
+    let before = Instant::now();
+    tokio::time::sleep(Duration::from_millis(delayms.min(10000).into())).await;
+    let resp = next.run(request).await;
+    let after = Instant::now();
+    (
+        AppendHeaders([("Server-Timing", format!("delay;dur={}", (after - before).as_millis()))]),
+        resp,
+    )
+}
+
+async fn delay_s(Path(delays): Path<u16>, request: Request, next: middleware::Next) -> impl IntoResponse {
+    delay_ms(Path(delays * 1000), request, next).await
 }
 
 #[derive(Deserialize, Serialize, Default)]

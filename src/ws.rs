@@ -2,23 +2,37 @@ use std::{net::SocketAddr, ops::ControlFlow, time::Duration};
 
 use axum::{
     extract::{
-        connect_info::ConnectInfo,
+        ConnectInfo,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     },
     http::StatusCode,
     response::IntoResponse,
 };
-use axum_extra::response::ErasedJson;
+use axum_extra::{extract::Query, response::ErasedJson};
+use serde::Deserialize;
 use tracing::info;
+
+#[derive(Debug, Deserialize)]
+pub struct EchoConfig {
+    max_fragment_size: Option<usize>,
+    max_message_size: Option<usize>,
+}
 
 pub async fn ws_handler(
     version: axum::http::Version,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(params): Query<EchoConfig>,
 ) -> impl IntoResponse {
     match ws {
-        Ok(ws) => {
+        Ok(mut ws) => {
             tracing::debug!("accepted a WebSocket using {version:?}");
+            if let Some(size) = params.max_fragment_size {
+                ws = ws.max_frame_size(size);
+            }
+            if let Some(size) = params.max_message_size {
+                ws = ws.max_message_size(size);
+            }
             ws.on_upgrade(move |socket| handle_socket(socket, addr))
         }
         Err(WebSocketUpgradeRejection::InvalidUpgradeHeader(_)) => (

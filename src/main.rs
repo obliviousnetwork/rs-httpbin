@@ -19,7 +19,7 @@ use axum_extra::{
     TypedHeader,
     extract::{CookieJar, Host, Query, cookie},
     headers::{
-        Authorization, ContentType, HeaderMapExt, UserAgent,
+        Authorization, ContentType, HeaderMapExt, Range, UserAgent,
         authorization::{Basic, Bearer},
     },
     response::ErasedJson,
@@ -29,6 +29,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use garde::Validate;
 use mime::{APPLICATION_JSON, IMAGE, TEXT_HTML_UTF_8, TEXT_PLAIN, TEXT_PLAIN_UTF_8, TEXT_XML};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::{
     ServiceBuilderExt, compression::CompressionLayer, cors::CorsLayer, request_id::MakeRequestUuid, set_header::SetRequestHeaderLayer,
@@ -127,6 +128,24 @@ fn app() -> Router<()> {
         .route("/status/{codes}", any(status::status))
         .route("/delay/{n}", any(anything).layer(middleware::from_fn(delay_s)))
         .route("/delay/ms/{n}", any(anything).layer(middleware::from_fn(delay_ms)))
+        .merge(
+            Router::new()
+                .route("/cache", any(cache::cache))
+                .route("/cache/{n}", any(cache::cache_n))
+                .route("/deny", any(deny))
+                .route("/bytes/{n}", any(bytes::bytes_n))
+                .route("/stream-bytes/{n}", any(stream_bytes::stream_bytes_n))
+                .route("/stream/{n}", any(stream::stream_n))
+                .route("/drip", any(drip::drip))
+                .route("/dump/request", any(dump_request))
+                .route("/etag/{etag}", any(etag::etag))
+                .route("/range/{n}", any(range::range)),
+        )
+        .merge(
+            Router::new()
+                .route("/digest-auth/{qop}/{user}/{passwd}", any(digest_auth::digest_auth_no_algo))
+                .route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}", any(digest_auth::digest_auth)),
+        )
         .route("/websocket/echo", any(ws::ws_handler))
         .route("/websocket/chat", any(ws_chat::ws_handler))
         .route(
@@ -912,5 +931,376 @@ r#"
             )
             .unwrap_or_default();
         Html(html).into_response()
+    }
+}
+
+async fn deny() -> impl IntoResponse {
+    into_response(TEXT_PLAIN_UTF_8, "YOU SHOULDN'T BE HERE")
+}
+
+mod cache {
+    use super::*;
+
+    pub async fn cache(headers: HeaderMap) -> Response {
+        if headers.contains_key(IF_MODIFIED_SINCE) || headers.contains_key(IF_NONE_MATCH) {
+            StatusCode::NOT_MODIFIED.into_response()
+        } else {
+            StatusCode::OK.into_response()
+        }
+    }
+
+    pub async fn cache_n(Path(n): Path<u32>) -> Response {
+        ([(CACHE_CONTROL, format!("public, max-age={n}"))], StatusCode::OK).into_response()
+    }
+}
+
+mod bytes {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    pub struct BytesQuery {
+        seed: Option<u64>,
+    }
+
+    pub async fn bytes_n(Path(n): Path<u32>, Query(q): Query<BytesQuery>) -> Response {
+        // Cap the response at 10 MiB so a single request cannot generate an unbounded body.
+        let n = n.min(10 * 1024 * 1024) as usize;
+        let mut buf = vec![0u8; n];
+        match q.seed {
+            Some(seed) => fastrand::Rng::with_seed(seed).fill(&mut buf),
+            None => fastrand::fill(&mut buf),
+        }
+        ([(CONTENT_TYPE, "application/octet-stream")], buf).into_response()
+    }
+}
+
+mod stream_bytes {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    pub struct StreamBytesQuery {
+        seed: Option<u64>,
+        chunk_size: Option<usize>,
+    }
+
+    pub async fn stream_bytes_n(Path(n): Path<u32>, Query(q): Query<StreamBytesQuery>) -> Response {
+        let total = n as usize;
+        let chunk_size = q.chunk_size.unwrap_or(1024).clamp(1, 10240);
+        let mut rng = match q.seed {
+            Some(seed) => fastrand::Rng::with_seed(seed),
+            None => fastrand::Rng::new(),
+        };
+        let stream = tokio_stream::iter((0..total).step_by(chunk_size).map(move |start| {
+            let end = (start + chunk_size).min(total);
+            let mut buf = vec![0u8; end - start];
+            rng.fill(&mut buf);
+            Ok::<_, std::io::Error>(Bytes::from(buf))
+        }));
+        ([(CONTENT_TYPE, "application/octet-stream")], Body::from_stream(stream)).into_response()
+    }
+}
+
+mod stream {
+    use super::*;
+
+    pub async fn stream_n(Path(n): Path<u32>) -> Response {
+        let n = n.min(100);
+        let stream = tokio_stream::iter((0..n).map(move |id| {
+            let line = serde_json::to_string(&json!({
+                "id": id,
+                "url": format!("/stream/{n}"),
+                "args": {},
+                "headers": {},
+            }))
+            .unwrap_or_default()
+                + "\n";
+            Ok::<_, std::io::Error>(Bytes::from(line))
+        }));
+        ([(CONTENT_TYPE, APPLICATION_JSON.as_ref())], Body::from_stream(stream)).into_response()
+    }
+}
+
+mod drip {
+    use tokio_stream::StreamExt as _;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    pub struct DripQuery {
+        numbytes: Option<usize>,
+        duration: Option<u64>,
+        delay: Option<u64>,
+        code: Option<u16>,
+    }
+
+    pub async fn drip(Query(q): Query<DripQuery>) -> Response {
+        let numbytes = q.numbytes.unwrap_or(10);
+        let duration = q.duration.unwrap_or(2);
+        let delay = q.delay.unwrap_or(0);
+        let code = StatusCode::from_u16(q.code.unwrap_or(200)).unwrap_or(StatusCode::OK);
+
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+
+        if numbytes == 0 {
+            return (code, [(CONTENT_TYPE, "application/octet-stream")], Body::empty()).into_response();
+        }
+        if duration == 0 {
+            return (
+                code,
+                [(CONTENT_TYPE, "application/octet-stream")],
+                Bytes::from(vec![b'*'; numbytes]),
+            )
+                .into_response();
+        }
+
+        let chunk_size = ((numbytes as f64 / duration as f64).ceil() as usize).max(1);
+        let num_chunks = numbytes.div_ceil(chunk_size);
+        let per_chunk = Duration::from_secs_f64(duration as f64 / num_chunks as f64);
+
+        let stream = tokio_stream::iter((0..numbytes).step_by(chunk_size).map(move |start| {
+            let len = chunk_size.min(numbytes - start);
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'*'; len]))
+        }))
+        .throttle(per_chunk);
+
+        (code, [(CONTENT_TYPE, "application/octet-stream")], Body::from_stream(stream)).into_response()
+    }
+}
+
+async fn dump_request(request: Request) -> Response {
+    use std::fmt::Write as _;
+
+    let (parts, body) = request.into_parts();
+    let version = match parts.version {
+        axum::http::Version::HTTP_09 => "HTTP/0.9",
+        axum::http::Version::HTTP_10 => "HTTP/1.0",
+        axum::http::Version::HTTP_11 => "HTTP/1.1",
+        axum::http::Version::HTTP_2 => "HTTP/2.0",
+        axum::http::Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    };
+
+    let mut dump = String::new();
+    let _ = writeln!(&mut dump, "{} {} {version}", parts.method, parts.uri);
+    for (k, v) in &parts.headers {
+        match v.to_str() {
+            Ok(v) => {
+                let _ = writeln!(&mut dump, "{k}: {v}");
+            }
+            Err(_) => {
+                let _ = writeln!(&mut dump, "{k}: <binary>");
+            }
+        }
+    }
+    let _ = writeln!(&mut dump);
+
+    let body = axum::body::to_bytes(body, 10_000_000).await.unwrap_or_default();
+    if !body.is_empty() {
+        match std::str::from_utf8(&body) {
+            Ok(body) => dump.push_str(body),
+            Err(_) => dump.push_str("<binary body>\n"),
+        }
+    }
+
+    ([(CONTENT_TYPE, "text/plain; charset=utf-8")], dump).into_response()
+}
+
+mod etag {
+    use super::*;
+
+    pub async fn etag(Path(etag): Path<String>, headers: HeaderMap) -> Response {
+        if let Some(tag) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+            && tag == etag
+        {
+            return StatusCode::NOT_MODIFIED.into_response();
+        }
+
+        if let Some(tag) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok())
+            && tag != etag
+        {
+            return StatusCode::PRECONDITION_FAILED.into_response();
+        }
+
+        ([(ETAG, etag.clone())], ErasedJson::pretty(json!({ "etag": etag }))).into_response()
+    }
+}
+
+mod range {
+    use std::ops::Bound;
+
+    use tokio_stream::StreamExt as _;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    pub struct RangeQuery {
+        duration: Option<f64>,
+        chunk_size: Option<usize>,
+    }
+
+    fn body_stream(start: u64, end: u64, chunk_size: usize, duration: f64) -> Body {
+        let chunk_size = chunk_size.max(1);
+        let chunks = ((end - start + 1) as usize).div_ceil(chunk_size);
+        let stream = tokio_stream::iter((start..=end).step_by(chunk_size).map(move |s| {
+            let len = (chunk_size as u64).min(end - s + 1) as usize;
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; len]))
+        }));
+        if duration > 0.0 && chunks > 0 {
+            Body::from_stream(stream.throttle(Duration::from_secs_f64(duration / chunks as f64)))
+        } else {
+            Body::from_stream(stream)
+        }
+    }
+
+    pub async fn range(Path(n): Path<u32>, range: Option<TypedHeader<Range>>, Query(q): Query<RangeQuery>) -> Response {
+        let total = n as u64;
+        let chunk_size = q.chunk_size.unwrap_or(1024);
+        let duration = q.duration.unwrap_or(0.0);
+
+        if total == 0 {
+            return (StatusCode::OK, [(CONTENT_TYPE, "application/octet-stream")]).into_response();
+        }
+
+        if let Some(TypedHeader(range)) = range {
+            if let Some((start_bound, end_bound)) = range.satisfiable_ranges(total).next() {
+                let start = match start_bound {
+                    Bound::Included(v) => v,
+                    Bound::Excluded(v) => v + 1,
+                    Bound::Unbounded => 0,
+                };
+                let end = match end_bound {
+                    Bound::Included(v) => v,
+                    Bound::Excluded(v) => v - 1,
+                    Bound::Unbounded => total - 1,
+                };
+                let end = end.min(total - 1);
+                if start > end {
+                    return (StatusCode::RANGE_NOT_SATISFIABLE, [(CONTENT_RANGE, format!("bytes */{total}"))]).into_response();
+                }
+                return (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (CONTENT_TYPE, "application/octet-stream".to_string()),
+                        (CONTENT_RANGE, format!("bytes {start}-{end}/{total}")),
+                    ],
+                    body_stream(start, end, chunk_size, duration),
+                )
+                    .into_response();
+            }
+            return (StatusCode::RANGE_NOT_SATISFIABLE, [(CONTENT_RANGE, format!("bytes */{total}"))]).into_response();
+        }
+
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/octet-stream")],
+            body_stream(0, total - 1, chunk_size, duration),
+        )
+            .into_response()
+    }
+}
+
+mod digest_auth {
+    use super::*;
+
+    const REALM: &str = "rs-httpbin";
+    const NONCE: &str = "deadbeef";
+    const OPAQUE: &str = "cafebabe";
+
+    pub async fn digest_auth(
+        Path((qop, user, passwd, algorithm)): Path<(String, String, String, String)>,
+        headers: HeaderMap,
+        method: Method,
+    ) -> Response {
+        handle(qop, user, passwd, algorithm, headers, method)
+    }
+
+    pub async fn digest_auth_no_algo(
+        Path((qop, user, passwd)): Path<(String, String, String)>,
+        headers: HeaderMap,
+        method: Method,
+    ) -> Response {
+        handle(qop, user, passwd, "MD5".to_string(), headers, method)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle(qop: String, user: String, passwd: String, algorithm: String, headers: HeaderMap, method: Method) -> Response {
+        let authorized = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|auth| verify(auth, &user, &passwd, &qop, &algorithm, method.as_str()))
+            .unwrap_or(false);
+
+        if authorized {
+            return (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/json")],
+                ErasedJson::pretty(json!({
+                    "authenticated": true,
+                    "user": user,
+                    "qop": qop,
+                    "algorithm": algorithm,
+                })),
+            )
+                .into_response();
+        }
+
+        let challenge = format!(r#"Digest realm="{REALM}",qop="{qop}",nonce="{NONCE}",opaque="{OPAQUE}",algorithm="{algorithm}""#);
+        (
+            StatusCode::UNAUTHORIZED,
+            [(WWW_AUTHENTICATE, challenge)],
+            ErasedJson::pretty(json!({ "authenticated": false, "user": user })),
+        )
+            .into_response()
+    }
+
+    fn hash(algorithm: &str, input: &str) -> Option<String> {
+        use sha2::Digest as _;
+
+        match algorithm.to_ascii_uppercase().as_str() {
+            "MD5" => Some(format!("{:x}", md5::compute(input))),
+            "SHA-256" => Some(format!("{:x}", sha2::Sha256::digest(input.as_bytes()))),
+            "SHA-512-256" => Some(format!("{:x}", sha2::Sha512_256::digest(input.as_bytes()))),
+            _ => None,
+        }
+    }
+
+    fn parse_digest(header: &str) -> Option<BTreeMap<String, String>> {
+        let header = header.strip_prefix("Digest ")?;
+        let mut map = BTreeMap::new();
+        for part in header.split(',') {
+            let part = part.trim();
+            if let Some((k, v)) = part.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
+            }
+        }
+        Some(map)
+    }
+
+    fn verify(header: &str, user: &str, passwd: &str, qop: &str, algorithm: &str, method: &str) -> Option<bool> {
+        let map = parse_digest(header)?;
+
+        if map.get("username")? != user || map.get("realm")? != REALM || map.get("nonce")? != NONCE {
+            return Some(false);
+        }
+
+        let uri = map.get("uri")?;
+        let response = map.get("response")?;
+
+        let ha1 = hash(algorithm, &format!("{user}:{REALM}:{passwd}"))?;
+        let ha2 = hash(algorithm, &format!("{method}:{uri}"))?;
+
+        let expected = match map.get("qop") {
+            Some(header_qop) => {
+                if !header_qop.eq_ignore_ascii_case(qop) {
+                    return Some(false);
+                }
+                let nc = map.get("nc")?;
+                let cnonce = map.get("cnonce")?;
+                hash(algorithm, &format!("{ha1}:{NONCE}:{nc}:{cnonce}:{header_qop}:{ha2}"))?
+            }
+            None => hash(algorithm, &format!("{ha1}:{NONCE}:{ha2}"))?,
+        };
+
+        Some(expected == *response)
     }
 }

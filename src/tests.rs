@@ -955,3 +955,308 @@ async fn status_multiple_choice() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn bytes_endpoint() -> Result<()> {
+    let response = app().oneshot(Request::builder().uri("/bytes/16").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/octet-stream");
+    assert_eq!(response.into_body().body().await.len(), 16);
+
+    // The same seed must yield the same bytes.
+    let a = app()
+        .oneshot(Request::builder().uri("/bytes/8?seed=42").body(Body::empty())?)
+        .await?
+        .into_body()
+        .body()
+        .await;
+    let b = app()
+        .oneshot(Request::builder().uri("/bytes/8?seed=42").body(Body::empty())?)
+        .await?
+        .into_body()
+        .body()
+        .await;
+    assert_eq!(a, b);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_bytes_endpoint() -> Result<()> {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/stream-bytes/2048?seed=7&chunk_size=512")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/octet-stream");
+    assert_eq!(response.into_body().body().await.len(), 2048);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_endpoint() -> Result<()> {
+    let response = app().oneshot(Request::builder().uri("/stream/10").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    let text = response.into_body().body_as_string().await;
+    assert_eq!(text.lines().count(), 10);
+    assert!(text.contains("\"id\":0"));
+    assert!(text.contains("\"id\":9"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cache_endpoint() -> Result<()> {
+    let response = app().oneshot(Request::builder().uri("/cache").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/cache")
+                .header(IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/cache")
+                .header(IF_NONE_MATCH, "\"abc\"")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cache_n_endpoint() -> Result<()> {
+    let response = app().oneshot(Request::builder().uri("/cache/123").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CACHE_CONTROL], "public, max-age=123");
+    Ok(())
+}
+
+#[tokio::test]
+async fn deny_endpoint() -> Result<()> {
+    let response = app().oneshot(Request::builder().uri("/deny").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().body_as_string().await, "YOU SHOULDN'T BE HERE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dump_request_endpoint() -> Result<()> {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dump/request?foo=bar")
+                .header("X-Test", "abc")
+                .body(Body::from("hello world"))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/plain; charset=utf-8");
+    let text = response.into_body().body_as_string().await;
+    assert!(text.contains("POST /dump/request?foo=bar HTTP/1.1"));
+    assert!(text.contains("x-test: abc"));
+    assert!(text.contains("hello world"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn drip_endpoint() -> Result<()> {
+    let start = Instant::now();
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/drip?numbytes=5&duration=1&delay=0&code=200")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/octet-stream");
+    let body = response.into_body().body().await;
+    assert_eq!(body.len(), 5);
+    assert!(start.elapsed() >= Duration::from_millis(900));
+    Ok(())
+}
+
+#[tokio::test]
+async fn etag_endpoint() -> Result<()> {
+    let response = app()
+        .oneshot(Request::builder().uri("/etag/test-etag").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[ETAG], "test-etag");
+
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/etag/test-etag")
+                .header(IF_NONE_MATCH, "test-etag")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/etag/test-etag")
+                .header(IF_MATCH, "other")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn range_endpoint() -> Result<()> {
+    let response = app()
+        .oneshot(Request::builder().uri("/range/100?chunk_size=10").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/octet-stream");
+    assert_eq!(response.into_body().body().await.len(), 100);
+
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .uri("/range/100?chunk_size=10")
+                .header("Range", "bytes=10-24")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[CONTENT_RANGE], "bytes 10-24/100");
+    assert_eq!(response.into_body().body().await.len(), 15);
+    Ok(())
+}
+
+fn md5_digest(input: &str) -> String {
+    format!("{:x}", md5::compute(input))
+}
+
+#[tokio::test]
+async fn digest_auth_endpoint() -> Result<()> {
+    let uri = "/digest-auth/auth/testuser/testpass/MD5";
+    let response = app().oneshot(Request::builder().uri(uri).body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers()[WWW_AUTHENTICATE]
+            .to_str()?
+            .contains("Digest realm=\"rs-httpbin\"")
+    );
+
+    let (user, realm, passwd, nonce, method, qop, nc, cnonce) = (
+        "testuser",
+        "rs-httpbin",
+        "testpass",
+        "deadbeef",
+        "GET",
+        "auth",
+        "00000001",
+        "123456",
+    );
+    let ha1 = md5_digest(&format!("{user}:{realm}:{passwd}"));
+    let ha2 = md5_digest(&format!("{method}:{uri}"));
+    let digest = md5_digest(&format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}"));
+    let auth = format!(
+        r#"Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{uri}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{digest}", opaque="cafebabe""#
+    );
+
+    let response = app()
+        .oneshot(Request::builder().uri(uri).header(AUTHORIZATION, auth).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().body_as_json().await;
+    assert_eq!(body["authenticated"], json!(true));
+    assert_eq!(body["user"], json!("testuser"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn digest_auth_sha256_endpoint() -> Result<()> {
+    use sha2::Digest as _;
+
+    let uri = "/digest-auth/auth/user/passwd/SHA-256";
+    let (user, realm, passwd, nonce, method, qop, nc, cnonce) =
+        ("user", "rs-httpbin", "passwd", "deadbeef", "GET", "auth", "00000001", "abcdef");
+    let hash = |input: String| format!("{:x}", sha2::Sha256::digest(input.as_bytes()));
+    let ha1 = hash(format!("{user}:{realm}:{passwd}"));
+    let ha2 = hash(format!("{method}:{uri}"));
+    let digest = hash(format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}"));
+    let auth = format!(
+        r#"Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{uri}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{digest}", algorithm=SHA-256"#
+    );
+
+    let response = app()
+        .oneshot(Request::builder().uri(uri).header(AUTHORIZATION, auth).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().body_as_json().await["authenticated"], json!(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn digest_auth_no_algo_endpoint() -> Result<()> {
+    let uri = "/digest-auth/auth/testuser/testpass";
+    let response = app().oneshot(Request::builder().uri(uri).body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers()[WWW_AUTHENTICATE]
+            .to_str()?
+            .contains("Digest realm=\"rs-httpbin\"")
+    );
+
+    let (user, realm, passwd, nonce, method, qop, nc, cnonce) = (
+        "testuser",
+        "rs-httpbin",
+        "testpass",
+        "deadbeef",
+        "GET",
+        "auth",
+        "00000001",
+        "123456",
+    );
+    let ha1 = md5_digest(&format!("{user}:{realm}:{passwd}"));
+    let ha2 = md5_digest(&format!("{method}:{uri}"));
+    let digest = md5_digest(&format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}"));
+    let auth = format!(
+        r#"Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{uri}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{digest}""#
+    );
+
+    let response = app()
+        .oneshot(Request::builder().uri(uri).header(AUTHORIZATION, auth).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().body_as_json().await["authenticated"], json!(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_echo_with_limits() -> Result<()> {
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(axum::serve(listener, app().into_make_service_with_connect_info::<SocketAddr>()).into_future());
+
+    let url = format!("ws://{addr}/websocket/echo?max_fragment_size=2048&max_message_size=10240");
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.expect("Failed to connect");
+
+    socket.send(Message::Text("hi".into())).await?;
+    let response = socket.next().await.unwrap()?;
+    assert_eq!(response.into_text()?, "echo --> hi");
+    socket.send(Message::Close(None)).await?;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    Ok(())
+}

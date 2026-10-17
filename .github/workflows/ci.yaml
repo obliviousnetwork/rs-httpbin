@@ -1,14 +1,38 @@
-name: Test
+name: CI
 
 on:
   push:
+    branches:
+      - main
   workflow_dispatch:
   pull_request:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
+  CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+          components: clippy
+          cache: true
+
+      # rustfmt.toml enables unstable options, so formatting is checked on nightly.
+      - name: Install nightly rustfmt
+        run: rustup toolchain install nightly --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   test:
     strategy:
       fail-fast: false
@@ -23,22 +47,36 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: moonrepo/setup-rust@v1
         with:
           channel: ${{ matrix.rust_toolchain }}
           bins: cargo-llvm-cov
-      
+          cache: true
+
       - name: Generate code coverage
         run: cargo llvm-cov test --all-features --workspace --lcov --output-path lcov.info
-      
+
       - name: Build
         run: cargo build --verbose
-      
+
       - name: Coveralls
         if: matrix.os == 'ubuntu-latest' && matrix.rust_toolchain == 'nightly'
         uses: coverallsapp/github-action@v2.1.0
-  
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
   build-image:
     runs-on: ubuntu-latest
     steps:
@@ -71,3 +109,24 @@ jobs:
           provenance: false
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.set-tag-name.outputs.result }}
+
+  deploy:
+    needs:
+      - lint
+      - test
+      - build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Never cancel a deploy that is already in flight; let it finish.
+    concurrency:
+      group: deploy-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

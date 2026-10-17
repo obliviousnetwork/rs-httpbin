@@ -863,3 +863,93 @@ async fn delay() -> Result<()> {
     assert!(end - start < Duration::from_secs_f32(n as f32 + 0.1));
     Ok(())
 }
+
+#[tokio::test]
+async fn status() -> Result<()> {
+    for code in [200, 301, 302, 303, 305, 307, 500, 599] {
+        let response = app()
+            .oneshot(Request::builder().uri(format!("/status/{code}")).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status().as_u16(), code);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_special_cases() -> Result<()> {
+    // 300 has a Location header and an HTML body
+    let response = app().oneshot(Request::builder().uri("/status/300").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::MULTIPLE_CHOICES);
+    assert_eq!(response.headers()[LOCATION], "/image/jpeg");
+    assert!(response.into_body().body_as_string().await.contains("Multiple Choices"));
+
+    // 301 redirects to /redirect/1
+    let response = app().oneshot(Request::builder().uri("/status/301").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(response.headers()[LOCATION], "/redirect/1");
+
+    // 401 challenges with basic auth
+    let response = app().oneshot(Request::builder().uri("/status/401").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[WWW_AUTHENTICATE], r#"Basic realm="Fake Realm""#);
+
+    // 418 has a body
+    let response = app().oneshot(Request::builder().uri("/status/418").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    assert_eq!(response.into_body().body_as_string().await, "I'm a teapot!");
+
+    // 406 has a JSON body
+    let response = app().oneshot(Request::builder().uri("/status/406").body(Body::empty())?).await?;
+    assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+    assert_eq!(
+        response.into_body().body_as_json().await["message"],
+        json!("Client did not request a supported media type")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_errors() -> Result<()> {
+    for url in ["/status/foo", "/status/3.14", "/status/600", "/status/1024"] {
+        let response = app().oneshot(Request::builder().uri(url).body(Body::empty())?).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{url}");
+    }
+
+    for url in ["/status", "/status/", "/status/200/foo"] {
+        let response = app().oneshot(Request::builder().uri(url).body(Body::empty())?).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{url}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_multiple_choice() -> Result<()> {
+    let allowed = [200u16, 429, 503];
+    for _ in 0..200 {
+        let response = app()
+            .oneshot(Request::builder().uri("/status/200:0.7,429:0.2,503:0.1").body(Body::empty())?)
+            .await?;
+        assert!(
+            allowed.contains(&response.status().as_u16()),
+            "unexpected status {}",
+            response.status()
+        );
+    }
+
+    // bad weight
+    let response = app()
+        .oneshot(Request::builder().uri("/status/200:foo,500:1").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // bad choice
+    let response = app()
+        .oneshot(Request::builder().uri("/status/200:1,foo:1").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}

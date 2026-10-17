@@ -124,6 +124,7 @@ fn app() -> Router<()> {
                 .route("/links/{total}/{page}", any(links::links)),
         )
         .route("/unstable", get(unstable))
+        .route("/status/{codes}", any(status::status))
         .route("/delay/{n}", any(anything).layer(middleware::from_fn(delay_s)))
         .route("/delay/ms/{n}", any(anything).layer(middleware::from_fn(delay_ms)))
         .route("/websocket/echo", any(ws::ws_handler))
@@ -309,6 +310,151 @@ mod basic_auth {
             )
                 .into_response()
         }
+    }
+}
+
+mod status {
+    use super::*;
+
+    const STATUS_300_BODY: &[u8] = br#"<!doctype html>
+<head>
+<title>Multiple Choices</title>
+</head>
+<body>
+<ul>
+<li><a href="/image/jpeg">/image/jpeg</a></li>
+<li><a href="/image/png">/image/png</a></li>
+<li><a href="/image/svg">/image/svg</a></li>
+</body>
+</html>"#;
+
+    const STATUS_308_BODY: &[u8] = br#"<!doctype html>
+<head>
+<title>Permanent Redirect</title>
+</head>
+<body>Permanently redirected to <a href="/image/jpeg">/image/jpeg</a>
+</body>
+</html>"#;
+
+    const STATUS_406_BODY: &[u8] = br#"{
+  "message": "Client did not request a supported media type",
+  "accept": [
+    "image/webp",
+    "image/svg+xml",
+    "image/jpeg",
+    "image/png",
+    "image/"
+  ]
+}
+"#;
+
+    pub async fn status(Path(codes): Path<String>) -> Response {
+        // A comma-separated list of codes (optionally with `:weight` suffixes)
+        // is treated as a weighted random choice.
+        if codes.contains(',') {
+            match parse_weighted_choices(&codes) {
+                Ok(choices) => do_status(weighted_random_choice(&choices)),
+                Err(detail) => bad_request(detail),
+            }
+        } else {
+            match parse_status_code(&codes) {
+                Ok(code) => do_status(code),
+                Err(detail) => bad_request(detail),
+            }
+        }
+    }
+
+    fn bad_request(detail: String) -> Response {
+        (
+            StatusCode::BAD_REQUEST,
+            ErasedJson::pretty(data::ErrorDetail::new(400, "Bad Request", detail)),
+        )
+            .into_response()
+    }
+
+    fn parse_status_code(input: &str) -> Result<u16, String> {
+        let code: u16 = input.parse().map_err(|err| format!("invalid status code: {input:?}: {err}"))?;
+        if !(100..=599).contains(&code) {
+            return Err(format!("invalid status code: {code} not in range [100, 599]"));
+        }
+        Ok(code)
+    }
+
+    fn parse_weighted_choices(input: &str) -> Result<Vec<(u16, f64)>, String> {
+        let mut choices = Vec::new();
+        for pair in input.split(',') {
+            let (raw_choice, raw_weight) = match pair.split_once(':') {
+                Some((choice, weight)) => (choice, Some(weight)),
+                None => (pair, None),
+            };
+            let weight = match raw_weight {
+                Some(weight) => weight.parse::<f64>().map_err(|_| format!("invalid weight value: {weight:?}"))?,
+                None => 1.0,
+            };
+            let code = parse_status_code(raw_choice).map_err(|_| format!("invalid choice value: {raw_choice:?}"))?;
+            choices.push((code, weight));
+        }
+        Ok(choices)
+    }
+
+    fn weighted_random_choice(choices: &[(u16, f64)]) -> u16 {
+        let total_weight: f64 = choices.iter().map(|(_, weight)| weight).sum();
+        let fallback = choices.last().map(|(code, _)| *code).unwrap_or(200);
+        if total_weight <= 0.0 {
+            return fallback;
+        }
+        let mut remaining = fastrand::f64() * total_weight;
+        for (code, weight) in choices {
+            remaining -= weight;
+            if remaining < 0.0 {
+                return *code;
+            }
+        }
+        fallback
+    }
+
+    fn do_status(code: u16) -> Response {
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+
+        let body: &[u8] = match code {
+            300 => {
+                headers.insert(LOCATION, HeaderValue::from_static("/image/jpeg"));
+                STATUS_300_BODY
+            }
+            301 | 302 | 303 | 305 | 307 => {
+                headers.insert(LOCATION, HeaderValue::from_static("/redirect/1"));
+                b""
+            }
+            308 => {
+                headers.insert(LOCATION, HeaderValue::from_static("/image/jpeg"));
+                STATUS_308_BODY
+            }
+            401 => {
+                headers.insert(WWW_AUTHENTICATE, HeaderValue::from_static(r#"Basic realm="Fake Realm""#));
+                b""
+            }
+            402 => {
+                headers.insert("x-more-info", HeaderValue::from_static("http://vimeo.com/22053820"));
+                b"Fuck you, pay me!"
+            }
+            406 => {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                STATUS_406_BODY
+            }
+            407 => {
+                headers.insert(PROXY_AUTHENTICATE, HeaderValue::from_static(r#"Basic realm="Fake Realm""#));
+                b""
+            }
+            418 => {
+                headers.insert("x-more-info", HeaderValue::from_static("http://tools.ietf.org/html/rfc2324"));
+                b"I'm a teapot!"
+            }
+            _ => b"",
+        };
+
+        (status, headers, body).into_response()
     }
 }
 

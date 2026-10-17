@@ -47,7 +47,7 @@ impl Shared {
     async fn broadcast(&mut self, _sender: Id, message: &Message) {
         // debug!("{:?}", &self.peers);
         for (id, to_user) in self.peers.iter_mut() {
-            println!("{} -> {:?}", id, &message);
+            println!("{} -> {:?}", id, message);
             // if *peer.0 != sender {
             let _ = to_user.send(message.clone());
             // }

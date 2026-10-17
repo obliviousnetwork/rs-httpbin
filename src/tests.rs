@@ -302,7 +302,7 @@ async fn anything() -> Result<()> {
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.body_as_json().await;
-    println!("{:#?}", &body);
+    println!("{:#?}", body);
     assert_eq!(body["origin"], json!("1.2.3.4"));
     assert_eq!(body["form"], json!(  {"a":"1", "b":["1","2","1"], "你好":"世界"}   ));
     assert_eq!(
@@ -345,7 +345,8 @@ async fn anything() -> Result<()> {
 #[tokio::test]
 async fn test_anything_multipart() -> Result<()> {
     let boundary = "AaB03x";
-    let body = format! {r#"--{boundary}
+    let body = format!(
+        r#"--{boundary}
 Content-Disposition: form-data; name="a"
 
 1
@@ -358,7 +359,8 @@ file1 content
 Content-Disposition: form-data; name="c"
 
 3
---{boundary}--"#}
+--{boundary}--"#
+    )
     .replace("\n", "\r\n");
     let response = app()
         .oneshot(
@@ -372,7 +374,7 @@ Content-Disposition: form-data; name="c"
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.body_as_json().await;
-    println!("{:#?}", &body);
+    println!("{:#?}", body);
     assert_eq!(body["origin"], json!("1.2.3.4"));
     assert_eq!(body["form"], json!({"a": "1", "c": "3"}));
     assert_eq!(body["files"]["b"], json!("file1 content"));
@@ -393,7 +395,7 @@ async fn test_anything_binary() -> Result<()> {
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.body_as_json().await;
-    println!("{:#?}", &body);
+    println!("{:#?}", body);
     assert_eq!(body["origin"], json!("1.2.3.4"));
     assert_eq!(body["data"], json!("/g=="));
 

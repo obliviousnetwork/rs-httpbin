@@ -3,6 +3,10 @@ primary_region = 'ord'
 
 [env]
 PORT = 3000
+# Beszel monitoring agent (see docker/beszel-entrypoint.sh). The token pair is
+# set with `fly secrets`; these two are not secret.
+BESZEL_HUB_URL = 'https://beszel-hub.exe.xyz'
+BESZEL_KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII2i2143ECxQGfSEYgxlJd97R/Zmp8UPeUOIgMB1TEUQ'
 
 [build]
 dockerfile = 'Dockerfile'
